@@ -1,219 +1,210 @@
-#include <Arduino_JSON.h>
+////////////////////////////////////////////////////////////////
+// Wireless Quiz Buzzer System                                //
+// Copyright (C) RobSmithDev 2022                             //
+// GPL3 Licence                                               //
+////////////////////////////////////////////////////////////////
+// Video: https://youtu.be/b3iqji1DUG0
+// https://robsmithdev.co.uk
+// https://youtube.com/c/robsmithdev
 
 
-/*
-  Getting Started example sketch for nRF24L01+ radios
-  This is a very basic example of how to send data from one node to another
-  but modified to include failure handling.
+#include <RF24.h>
+#include <EEPROM.h>
 
-  The nrf24l01+ radios are fairly reliable devices, but on breadboards etc, with inconsistent wiring, failures may
-  occur randomly after many hours to days or weeks. This sketch demonstrates how to handle the various failures and
-  keep the radio operational.
+//   Arduino nano V3 wiring (https://www.aliexpress.com/item/1005001403540074.html)
+//   4 -> Button to GND
+//   5 -> LED to GND (Button)
+//  10 -> CE  (nRF24)
+//   9 -> CSN (nRF24)
+//  11 -> MO  (nRF24)
+//  12 -> MI  (nRF24)
+//  13 -> SCK (nRF24)
 
-  The three main failure modes of the radio include:
-  Writing to radio: Radio unresponsive - Fixed internally by adding a timeout to the internal write functions in RF24 (failure handling)
-  Reading from radio: Available returns true always - Fixed by adding a timeout to available functions by the user. This is implemented internally in  RF24Network.
-  Radio configuration settings are lost - Fixed by monitoring a value that is different from the default, and re-configuring the radio if this setting reverts to the default.
+RF24 radio(10, 9); // CE, CSN
 
-  The printDetails output should appear as follows for radio #0:
+#define PIN_BUTTON   4
+#define PIN_LED      5
 
-  STATUS         = 0x0e RX_DR=0 TX_DS=0 MAX_RT=0 RX_P_NO=7 TX_FULL=0
-  RX_ADDR_P0-1   = 0x65646f4e31 0x65646f4e32
-  RX_ADDR_P2-5   = 0xc3 0xc4 0xc5 0xc6
-  TX_ADDR        = 0x65646f4e31
-  RX_PW_P0-6     = 0x20 0x20 0x00 0x00 0x00 0x00
-  EN_AA          = 0x3f
-  EN_RXADDR      = 0x02
-  RF_CH          = 0x4c
-  RF_SETUP       = 0x03
-  CONFIG         = 0x0f
-  DYNPD/FEATURE  = 0x00 0x00
-  Data Rate      = 1MBPS
-  Model          = nRF24L01+
-  CRC Length     = 16 bits
-  PA Power       = PA_LOW
+// LED status options
+enum LedStatus : unsigned char { lsOff = 0, lsOn = 1, lsFlashing = 2 };
 
-  Users can use this sketch to troubleshoot radio module wiring etc. as it makes the radios hot-swapable
+// Last loop start time
+unsigned long lastLoopTime = 0;
 
-  Updated: 2019 by TMRh20
-*/
+// If this is in contact with the controller
+bool isConnected = false;
+// Last time we sent some status
+unsigned long lastStatusSend = 0;
+// When the button was pressed down
+unsigned long buttonDownTime = 0;
+// If the button is enabled
+bool buttonEnabled = false;
+// Status of the LED
+LedStatus ledStatus = lsOff;
 
-#include <SPI.h>
-#include "RF24.h"
-#include "printf.h"
+// Which button number we are
+unsigned char buttonNumber = EEPROM.read(0);
 
-/****************** User Config ***************************/
-/***      Set this radio as radio number 0 or 1         ***/
-bool radioNumber = 1;
-
-/* Hardware configuration: Set up nRF24L01 radio on SPI bus plus pins 7 & 8 */
-RF24 radio(10, 9);
-/**********************************************************/
-
-byte addresses[][6] = { "1Node", "2Node" };
-
-// Used to control whether this node is sending or receiving
-bool role = 0;
-
-
-/**********************************************************/
-//Function to configure the radio
-void configureRadio() {
-
-  radio.begin();
-
-  // Set the PA Level low to prevent power supply related issues since this is a
-  // getting_started sketch, and the likelihood of close proximity of the devices. RF24_PA_MAX is default.
-  radio.setPALevel(RF24_PA_LOW);
-
-  // Open a writing and reading pipe on each radio, with opposite addresses
-  if (radioNumber) {
-    radio.openWritingPipe(addresses[1]);
-    radio.openReadingPipe(1, addresses[0]);
-  } else {
-    radio.openWritingPipe(addresses[0]);
-    radio.openReadingPipe(1, addresses[1]);
-  }
-
-  // Start the radio listening for data
-  radio.startListening();
-  radio.printDetails();
-}
-
-
-/**********************************************************/
-
+// Main setup function
 void setup() {
-  Serial.begin(115200);
-  Serial.println(F("RF24/examples/GettingStarted"));
-  Serial.println(F("*** PRESS 'T' to begin transmitting to the other node"));
+  // put your setup code here, to run once:
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_LED, OUTPUT);
 
-  printf_begin();
+  // put your setup code here, to run once:
+  Serial.begin(57600);
+  while (!Serial) {};
 
-  configureRadio();
+  while ((buttonNumber < 1) || (buttonNumber > 4)) {
+    // A dirty PWM for dim brightness
+    digitalWrite(PIN_LED, HIGH);
+    delay(1);
+    digitalWrite(PIN_LED, LOW);
+    delay(10);
+    if (Serial.available()) {
+      char id = Serial.read();
+      if ((id >= '1') && (id <= '4')) {
+        buttonNumber = id - '0';
+        EEPROM.write(0, buttonNumber);
+      }
+    }
+  }
+
+  // Setup the radio device
+  if (!radio.begin()) {
+    Serial.write("RF24 device failed to begin\n");
+  }
+  radio.setPALevel(RF24_PA_HIGH);     // Max power
+  radio.enableDynamicPayloads();
+  radio.enableAckPayload();
+  radio.setDataRate(RF24_250KBPS);
+  radio.setRetries(2, 2);
+  radio.maskIRQ(false, false, false);  // not using the IRQs
+
+  if (!radio.isChipConnected()) {
+    Serial.write("RF24 device not detected.\n");
+  } else {
+    Serial.write("RF24 device found\n");
+  }
+
+  // Configure the i/o
+  char pipe[6] = "1QBTN";
+  radio.openWritingPipe((uint8_t*)pipe);
+  pipe[0] = '0';
+  radio.openReadingPipe(1, (uint8_t*)pipe);
+  radio.stopListening();
 }
 
-uint32_t configTimer = millis();
+// Search for the button controller channel
+bool findButtonController() {
+  Serial.write("Searching for controller...\n");
 
-void loop() {
-
-  if (radio.failureDetected) {
-    radio.failureDetected = false;
-    delay(250);
-    Serial.println("Radio failure detected, restarting radio");
-    configureRadio();
-  }
-  // Every 5 seconds, verify the configuration of the radio. This can be
-  // done using any setting that is different from the radio defaults.
-  if (millis() - configTimer > 5000) {
-    configTimer = millis();
-    if (radio.getDataRate() != RF24_1MBPS) {
-      radio.failureDetected = true;
-      Serial.print("Radio configuration error detected");
+  for (int a = 125; a > 0; a -= 10) {
+    radio.setChannel(a);
+    delay(15);
+    // Send a single byte for status
+    if (sendButtonStatus(false)) {
+      Serial.write("Quiz Controller found on channel ");
+      char buffer[10];
+      itoa(a, buffer, 10);
+      Serial.write(buffer);
+      Serial.write("\n");
+      return true;
     }
+    digitalWrite(PIN_LED, (millis() & 2047) > 2000);
   }
 
+  // Add a 1.5 second pause before trying again (but still flash the LED)
+  unsigned long m = millis();
+  while (millis() - m < 1500) {
+    digitalWrite(PIN_LED, (millis() & 2047) > 2000);
+    delay(15);
+  }
 
-  /****************** Ping Out Role ***************************/
+  return false;
+}
 
-  if (role == 1) {
+// Attempt to send the sttaus of the button and receive what we shoudl be doing
+bool sendButtonStatus(bool isDown) {
+  unsigned char message = buttonNumber;
+  if (isDown) message |= 128;
 
-    radio.stopListening();  // First, stop listening so we can talk.
+  for (unsigned char retries = 0; retries < 4; retries++) {
+    // This delay is used incase transmit fails.  We will assume it fails because of data collision with another button.
+    // This is inspired by https://www.geeksforgeeks.org/back-off-algorithm-csmacd/
+    unsigned int randomDelayAmount = random(1, 2 + ((retries * retries) * 2));
+    if (radio.write(&message, 1)) {
+      if (radio.available()) {
+        if (radio.getDynamicPayloadSize() == 4) {
+          unsigned char tmp[4];
+          radio.read(&tmp, 4);
 
-    Serial.println(F("Now sending"));
+          buttonEnabled = (tmp[buttonNumber - 1] & 128) != 0;
+          ledStatus = (LedStatus)(tmp[buttonNumber - 1] & 3);
+          Serial.write("Write OK, ACK Payload\n");
 
-    unsigned long start_time = micros();  // Take the time, and send it.  This will block until complete
-    if (!radio.write(&start_time, sizeof(unsigned long))) {
-      Serial.println(F("failed"));
-    }
-
-    radio.startListening();  // Now, continue listening
-
-    unsigned long started_waiting_at = micros();  // Set up a timeout period, get the current microseconds
-    bool timeout = false;                         // Set up a variable to indicate if a response was received or not
-
-    while (!radio.available())  // While nothing is received
-    {
-      if (micros() - started_waiting_at > 200000)  // If waited longer than 200ms, indicate timeout and exit while loop
-      {
-        timeout = true;
-        break;
+          return true;
+        } else {
+          // Remove redundant data
+          int total = radio.getDynamicPayloadSize();
+          unsigned char tmp;
+          while (total-- > 0) radio.read(&tmp, 1);
+          Serial.write("Write OK, ACK wrong size\n");
+          delay(randomDelayAmount);
+        }
+      } else {
+        // This shouldn't really happen, but can sometimes if the controller is busy
+        Serial.write("Write OK, no ACK\n");
+        return true;
       }
-    }
-
-    if (timeout) {
-      // Describe the results
-      Serial.println(F("Failed, response timed out."));
     } else {
-      // Grab the response, compare, and send to debugging spew
+      delay(randomDelayAmount);
+    }
+  }
 
-      unsigned long got_time;  // Variable for the received timestamp
+  Serial.write("Write Failed\n");
+  return false;
+}
 
-      // Failure Handling
-      uint32_t failTimer = millis();
-      while (radio.available())  // If available() always returns true, there is a problem
-      {
-        if (millis() - failTimer > 250) {
-          radio.failureDetected = true;
-          Serial.println("Radio available failure detected");
-          break;
-        }
-        radio.read(&got_time, sizeof(unsigned long));
+// Main loop
+void loop() {
+  lastLoopTime = millis();
+
+  if (radio.isChipConnected()) {
+
+    // If connectin ACK timeout or not connected
+    if ((lastLoopTime - lastStatusSend > 1000) || (!isConnected)) {
+      // A short blip meaning its powered up, but not working
+      while (!findButtonController()) {};
+      digitalWrite(PIN_LED, LOW);
+      isConnected = true;
+      lastStatusSend = lastLoopTime;
+    }
+
+    // If the button was pressed down (and its been 300ms since last check)
+    if ((digitalRead(PIN_BUTTON) == LOW) && (lastLoopTime - buttonDownTime > 300) && (buttonEnabled)) {
+      // This ensures we get a random number sequence unique to this player.  The random number is used to prevent packet collision
+      randomSeed(lastLoopTime);
+      // Send the DOWN state
+      if (sendButtonStatus(true)) {
+        buttonDownTime = lastLoopTime;
+        lastStatusSend = lastLoopTime;
       }
-      unsigned long end_time = micros();
-
-      // Spew it
-      Serial.print(F("Sent "));
-      Serial.print(start_time);
-      Serial.print(F(", Got response "));
-      Serial.print(got_time);
-      Serial.print(F(", Round-trip delay "));
-      Serial.print(end_time - start_time);
-      Serial.println(F(" microseconds"));
     }
 
-    delay(1000);  // Try again 1s later
-  }
-
-
-  /****************** Pong Back Role ***************************/
-
-  if (role == 0) {
-    unsigned long got_time;  // Variable for the received timestamp
-
-    if (radio.available()) {
-      uint32_t failTimer = millis();
-
-      while (radio.available())  // While there is data ready
-      {
-        if (millis() - failTimer > 500) {
-          Serial.println("Radio available failure detected");
-          radio.failureDetected = true;
-          break;
-        }
-        radio.read(&got_time, sizeof(unsigned long));  // Get the payload
-      }
-
-      radio.stopListening();                          // First, stop listening so we can talk
-      radio.write(&got_time, sizeof(unsigned long));  // Send the final one back.
-      radio.startListening();                         // Now, resume listening so we catch the next packets.
-      Serial.print(F("Sent response "));
-      Serial.println(got_time);
+    // If its been 150ms since last TX send status
+    if (lastLoopTime - lastStatusSend > 150) {
+      if (sendButtonStatus(false)) {
+        lastStatusSend = lastLoopTime;
+      } else delay(10);
     }
+
+    digitalWrite(PIN_LED, (ledStatus == lsOn) || ((ledStatus == lsFlashing) && ((lastLoopTime & 255) > 128)));
+  } else {
+    // Error flash sequence
+    digitalWrite(PIN_LED, (lastLoopTime & 1023) < 100);
   }
 
-
-  /****************** Change Roles via Serial Commands ***************************/
-
-  if (Serial.available()) {
-    char c = toupper(Serial.read());
-    if (c == 'T' && role == 0) {
-      Serial.println(F("*** CHANGING TO TRANSMIT ROLE -- PRESS 'R' TO SWITCH BACK"));
-      role = 1;  // Become the primary transmitter (ping out)
-    } else if (c == 'R' && role == 1) {
-      Serial.println(F("*** CHANGING TO RECEIVE ROLE -- PRESS 'T' TO SWITCH BACK"));
-      role = 0;  // Become the primary receiver (pong back)
-      radio.startListening();
-    }
-  }
-}  // Loop
+  // Slow the main loop down
+  delay(1);
+}
